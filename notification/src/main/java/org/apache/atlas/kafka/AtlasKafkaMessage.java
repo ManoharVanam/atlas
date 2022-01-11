@@ -26,17 +26,26 @@ public class AtlasKafkaMessage<T> {
     private final TopicPartition topicPartition;
     private final boolean        spooled;
     private final long           msgCreated;
+    private final String         key;
+    private final String         actaulEvent;
 
-    public AtlasKafkaMessage(T message, long offset, String topic, int partition, long msgCreated, boolean spooled) {
+
+    public AtlasKafkaMessage(T message, long offset, String topic, int partition, long msgCreated, boolean spooled, String key, String actaulEvent) {
         this.message        = message;
         this.offset         = offset;
         this.topicPartition = new TopicPartition(topic, partition);
         this.msgCreated     = msgCreated;
         this.spooled        = spooled;
+        this.key = key;
+        this.actaulEvent = actaulEvent;
+    }
+
+    public AtlasKafkaMessage(T message, long offset, String topic, int partition, String key, String actaulEvent) {
+        this(message, offset, topic, partition, 0, false, key, actaulEvent);
     }
 
     public AtlasKafkaMessage(T message, long offset, String topic, int partition) {
-        this(message, offset, topic, partition, 0, false);
+        this(message, offset, topic, partition, 0, false, null, null);
     }
 
     public T getMessage() {
@@ -65,5 +74,12 @@ public class AtlasKafkaMessage<T> {
 
     public long getMsgCreated() {
         return this.msgCreated;
+    }
+
+    public String getKey() {
+        return this.key;
+    }
+    public String getActaulEvent() {
+        return this.actaulEvent;
     }
 }

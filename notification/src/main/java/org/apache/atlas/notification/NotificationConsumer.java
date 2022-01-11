@@ -63,4 +63,6 @@ public interface NotificationConsumer<T> {
      * @return List containing kafka message and partionId and offset.
      */
     List<AtlasKafkaMessage<T>> receiveWithCheckedCommit(Map<TopicPartition, Long> lastCommittedPartitionOffset);
+
+    boolean isExtraConsumer();
 }

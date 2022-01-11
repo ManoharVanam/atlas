@@ -44,6 +44,7 @@ import org.springframework.stereotype.Component;
 import javax.inject.Inject;
 import java.util.*;
 import java.util.concurrent.Future;
+import java.util.stream.Stream;
 
 import static org.apache.atlas.security.SecurityProperties.TRUSTSTORE_PASSWORD_KEY;
 import static org.apache.atlas.security.SecurityProperties.TLS_ENABLED;
@@ -63,6 +64,7 @@ public class KafkaNotification extends AbstractNotification implements Service {
     protected static final String CONSUMER_GROUP_ID_PROPERTY = "group.id";
 
     private   static final String[] ATLAS_HOOK_CONSUMER_TOPICS     = AtlasConfiguration.NOTIFICATION_HOOK_CONSUMER_TOPIC_NAMES.getStringArray(ATLAS_HOOK_TOPIC);
+    private   static final String[] ATLAS_HOOK_EXTRA_PRODUCER_TOPIC_NAMES     = AtlasConfiguration.NOTIFICATION_HOOK_EXTRA_PRODUCER_TOPIC_NAMES.getStringArray("ATLAS_MULTI_1");
     private   static final String[] ATLAS_ENTITIES_CONSUMER_TOPICS = AtlasConfiguration.NOTIFICATION_ENTITIES_CONSUMER_TOPIC_NAMES.getStringArray(ATLAS_ENTITIES_TOPIC);
 
     private static final String DEFAULT_CONSUMER_CLOSED_ERROR_MESSAGE = "This consumer has already been closed.";
@@ -78,6 +80,13 @@ public class KafkaNotification extends AbstractNotification implements Service {
         {
             put(NotificationType.HOOK, trimAndPurge(ATLAS_HOOK_CONSUMER_TOPICS));
             put(NotificationType.ENTITIES, trimAndPurge(ATLAS_ENTITIES_CONSUMER_TOPICS));
+        }
+    };
+
+    private static final Map<NotificationType, String[]> CONSUMER_EXTRA_TOPICS_MAP = new HashMap<NotificationType, String[]>() {
+        {
+            put(NotificationType.HOOK, trimAndPurge(ATLAS_HOOK_EXTRA_PRODUCER_TOPIC_NAMES));
+//            put(NotificationType.ENTITIES, trimAndPurge(ATLAS_ENTITIES_CONSUMER_TOPICS));
         }
     };
 
@@ -193,8 +202,17 @@ public class KafkaNotification extends AbstractNotification implements Service {
     public <T> List<NotificationConsumer<T>> createConsumers(NotificationType notificationType, int numConsumers, boolean autoCommitEnabled) {
         LOG.info("==> KafkaNotification.createConsumers(notificationType={}, numConsumers={}, autoCommitEnabled={})", notificationType, numConsumers, autoCommitEnabled);
 
-        String[] topics = CONSUMER_TOPICS_MAP.get(notificationType);
+//        String[] topics = CONSUMER_TOPICS_MAP.get(notificationType);
+//        String[] extraTopics = CONSUMER_EXTRA_TOPICS_MAP.get(notificationType);
+//        String[] topics = Stream.concat(Arrays.stream(hook_topics), Arrays.stream(extraTopics))
+//                .toArray(String[]::new);
+        List<NotificationConsumer<T>> consumerList = createConsumers(notificationType, numConsumers, autoCommitEnabled, false);
+        consumerList.addAll(createConsumers(notificationType, numConsumers, autoCommitEnabled, true));
+        return consumerList;
+    }
 
+    private <T> List<NotificationConsumer<T>> createConsumers(NotificationType notificationType, int numConsumers, boolean autoCommitEnabled, boolean createExtraConsumers) {
+        String[] topics = createExtraConsumers? CONSUMER_EXTRA_TOPICS_MAP.get(notificationType) : CONSUMER_TOPICS_MAP.get(notificationType);
         if (numConsumers < topics.length) {
             LOG.warn("consumers count {} is fewer than number of topics {}. Creating {} consumers, so that consumer count is equal to number of topics.", numConsumers, topics.length, topics.length);
 
@@ -219,16 +237,16 @@ public class KafkaNotification extends AbstractNotification implements Service {
         consumerProperties.put("enable.auto.commit", autoCommitEnabled);
 
         for (int i = 0; i < numConsumers; i++) {
-            KafkaConsumer existingConsumer = notificationConsumers.size() > i ? notificationConsumers.get(i) : null;
-            KafkaConsumer kafkaConsumer    = getOrCreateKafkaConsumer(existingConsumer, consumerProperties, notificationType, i);
+            KafkaConsumer existingConsumer = notificationConsumers.size() > i && !createExtraConsumers ? notificationConsumers.get(i) : null;
+            KafkaConsumer kafkaConsumer    = getOrCreateKafkaConsumer(existingConsumer, consumerProperties, notificationType, i, createExtraConsumers);
 
-            if (notificationConsumers.size() > i) {
+            if (notificationConsumers.size() > i && !createExtraConsumers) {
                 notificationConsumers.set(i, kafkaConsumer);
             } else {
                 notificationConsumers.add(kafkaConsumer);
             }
 
-            consumers.add(new AtlasKafkaConsumer(notificationType, kafkaConsumer, autoCommitEnabled, pollTimeOutMs));
+            consumers.add(new AtlasKafkaConsumer(notificationType, kafkaConsumer, autoCommitEnabled, pollTimeOutMs, createExtraConsumers));
         }
 
         LOG.info("<== KafkaNotification.createConsumers(notificationType={}, numConsumers={}, autoCommitEnabled={})", notificationType, numConsumers, autoCommitEnabled);
@@ -322,12 +340,12 @@ public class KafkaNotification extends AbstractNotification implements Service {
     }
 
     @VisibleForTesting
-    public KafkaConsumer getOrCreateKafkaConsumer(KafkaConsumer existingConsumer, Properties consumerProperties, NotificationType notificationType, int idxConsumer) {
+    public KafkaConsumer getOrCreateKafkaConsumer(KafkaConsumer existingConsumer, Properties consumerProperties, NotificationType notificationType, int idxConsumer, boolean createExtraConsumers) {
         KafkaConsumer ret = existingConsumer;
 
         try {
             if (ret == null || !isKafkaConsumerOpen(ret)) {
-                String[] topics = CONSUMER_TOPICS_MAP.get(notificationType);
+                String[] topics = createExtraConsumers? CONSUMER_EXTRA_TOPICS_MAP.get(notificationType) : CONSUMER_TOPICS_MAP.get(notificationType);
                 String   topic  = topics[idxConsumer % topics.length];
 
                 LOG.debug("Creating new KafkaConsumer for topic : {}, index : {}", topic, idxConsumer);

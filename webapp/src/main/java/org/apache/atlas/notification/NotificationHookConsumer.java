@@ -43,6 +43,7 @@ import org.apache.atlas.notification.preprocessor.PreprocessorContext.Preprocess
 import org.apache.atlas.repository.store.graph.EntityCorrelationStore;
 import org.apache.atlas.util.AtlasMetricsCounter;
 import org.apache.atlas.utils.AtlasJson;
+import org.apache.atlas.utils.KafkaUtils;
 import org.apache.atlas.utils.LruCache;
 import org.apache.atlas.util.AtlasMetricsUtil;
 import org.apache.atlas.util.AtlasMetricsUtil.NotificationStat;
@@ -67,7 +68,13 @@ import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.collections.MapUtils;
 import org.apache.commons.collections4.map.PassiveExpiringMap;
 import org.apache.commons.configuration.Configuration;
+import org.apache.commons.configuration.ConfigurationConverter;
 import org.apache.commons.lang.StringUtils;
+import org.apache.kafka.clients.consumer.ConsumerConfig;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.clients.producer.RecordMetadata;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,23 +90,19 @@ import org.springframework.stereotype.Component;
 
 import javax.inject.Inject;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.regex.Pattern;
 
 import static org.apache.atlas.model.instance.AtlasObjectId.*;
 import static org.apache.atlas.notification.preprocessor.EntityPreprocessor.TYPE_HIVE_PROCESS;
+import static org.apache.atlas.security.SecurityProperties.TLS_ENABLED;
+import static org.apache.atlas.security.SecurityProperties.TRUSTSTORE_PASSWORD_KEY;
+import static org.apache.atlas.security.SecurityUtil.getPassword;
 import static org.apache.atlas.web.security.AtlasAbstractAuthenticationProvider.getAuthoritiesFromUGI;
 
 
@@ -201,6 +204,7 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
 
     @VisibleForTesting
     List<HookConsumer> consumers;
+    List<HookConsumer> extraConsumers;
 
     @Inject
     public NotificationHookConsumer(NotificationInterface notificationInterface, AtlasEntityStore atlasEntityStore,
@@ -346,6 +350,52 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
             LOG.info("HA is disabled, starting consumers inline.");
 
             startConsumers(executorService);
+            createOrGetProducer();
+        }
+    }
+
+    private final Map<String, KafkaProducer>       producers = new HashMap<>();
+    private final String producerName = "MY_PRODUCER";
+    private KafkaProducer createOrGetProducer() {
+
+        if(producers.containsKey(producerName))
+            return producers.get(producerName);
+        else {
+            LOG.info("==> Start My Producer()");
+            String PROPERTY_PREFIX = "atlas.kafka";
+            Configuration kafkaConf = ApplicationProperties.getSubsetConfiguration(applicationProperties, PROPERTY_PREFIX);
+            Properties properties = ConfigurationConverter.getProperties(kafkaConf);
+            Long pollTimeOutMs = kafkaConf.getLong("poll.timeout.ms", 1000);
+
+            //Override default configs
+            properties.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
+            properties.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringSerializer");
+            properties.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+            properties.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG, "org.apache.kafka.common.serialization.StringDeserializer");
+            properties.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+
+            boolean oldApiCommitEnableFlag = kafkaConf.getBoolean("auto.commit.enable", false);
+
+            //set old autocommit value if new autoCommit property is not set.
+            properties.put("enable.auto.commit", kafkaConf.getBoolean("enable.auto.commit", oldApiCommitEnableFlag));
+            properties.put("session.timeout.ms", kafkaConf.getString("session.timeout.ms", "30000"));
+
+            if (applicationProperties.getBoolean(TLS_ENABLED, false)) {
+                try {
+                    properties.put("ssl.truststore.password", getPassword(applicationProperties, TRUSTSTORE_PASSWORD_KEY));
+                } catch (Exception e) {
+                    LOG.error("Exception while getpassword truststore.password ", e);
+                }
+            }
+
+            // if no value is specified for max.poll.records, set to 1
+            properties.put("max.poll.records", kafkaConf.getInt("max.poll.records", 1));
+
+            KafkaUtils.setKafkaJAASProperties(applicationProperties, properties);
+
+            LOG.info("<== Started My producer ===>");
+            producers.put(producerName, new KafkaProducer(properties));
+            return producers.get(producerName);
         }
     }
 
@@ -367,6 +417,24 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
         }
     }
 
+//    private void startHookConsumer(ExecutorService executorService) {
+//        int                                          numThreads            = applicationProperties.getInt(CONSUMER_THREADS_PROPERTY, 1);
+//        List<NotificationConsumer<HookNotification>> notificationConsumers = notificationInterface.createConsumers(NotificationType.HOOK, numThreads);
+//
+//        if (executorService == null) {
+//            executorService = Executors.newFixedThreadPool(notificationConsumers.size(), new ThreadFactoryBuilder().setNameFormat(THREADNAME_PREFIX + " thread-%d").build());
+//        }
+//
+//        executors = executorService;
+//
+//        for (final NotificationConsumer<HookNotification> consumer : notificationConsumers) {
+//            HookConsumer hookConsumer = new HookConsumer(consumer);
+//
+//            consumers.add(hookConsumer);
+//            executors.submit(hookConsumer);
+//        }
+//    }
+
     @Override
     public void stop() {
         //Allow for completion of outstanding work
@@ -376,6 +444,7 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
             }
 
             stopConsumerThreads();
+            stopProducers();
             if (executors != null) {
                 executors.shutdown();
 
@@ -390,6 +459,21 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
         } catch (InterruptedException e) {
             LOG.error("Failure in shutting down consumers");
         }
+    }
+
+    private void stopProducers() {
+        for (KafkaProducer producer : producers.values()) {
+            if (producer != null) {
+                try {
+                    producer.close();
+                } catch (Throwable t) {
+                    LOG.error("failed to close Kafka producer. Ignoring", t);
+                }
+            }
+        }
+
+        producers.clear();
+//        producers.get(producerName).close();
     }
 
     private void stopConsumerThreads() {
@@ -528,12 +612,20 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
         private final AtomicBoolean                          shouldRun      = new AtomicBoolean(false);
         private final List<String>                           failedMessages = new ArrayList<>();
         private final AdaptiveWaiter                         adaptiveWaiter = new AdaptiveWaiter(minWaitDuration, maxWaitDuration, minWaitDuration);
-
+//        private final AtomicBoolean isExtraConsumer = new AtomicBoolean(false);;
         public HookConsumer(NotificationConsumer<HookNotification> consumer) {
             super("atlas-hook-consumer-thread", false);
 
             this.consumer = consumer;
         }
+
+//        public HookConsumer(NotificationConsumer<HookNotification> consumer, Boolean isExtraConsumer) {
+//            super("atlas-hook-consumer-thread", false);
+//
+//            this.consumer = consumer;
+//            if(isExtraConsumer)
+//                this.isExtraConsumer.set(true);
+//        }
 
         @Override
         public void doWork() {
@@ -551,7 +643,13 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
                         List<AtlasKafkaMessage<HookNotification>> messages = consumer.receiveWithCheckedCommit(lastCommittedPartitionOffset);
 
                         for (AtlasKafkaMessage<HookNotification> msg : messages) {
-                            handleMessage(msg);
+//                            handleMessage(msg);
+                            if (consumer.isExtraConsumer()) {
+                                handleMessage(msg);
+                            } else {
+                                produceEventWithKey(msg);
+                            }
+
                         }
                     } catch (IllegalStateException ex) {
                         adaptiveWaiter.pause(ex);
@@ -576,6 +674,51 @@ public class NotificationHookConsumer implements Service, ActiveStateChangeHandl
             }
         }
 
+        private class MessageContext {
+            private final Future<RecordMetadata> future;
+            private final String                 message;
+
+            public MessageContext(Future<RecordMetadata> future, String message) {
+                this.future  = future;
+                this.message = message;
+            }
+
+            public Future<RecordMetadata> getFuture() {
+                return future;
+            }
+
+            public String getMessage() {
+                return message;
+            }
+        }
+
+        String[] ATLAS_HOOK_EXTRA_PRODUCR_TOPICS = AtlasConfiguration.NOTIFICATION_HOOK_EXTRA_PRODUCER_TOPIC_NAMES.getStringArray("ATLAS_MULTI_1");
+
+        private void produceEventWithKey(AtlasKafkaMessage<HookNotification> kafkaMsg) {
+            List<MessageContext> messageContexts = new ArrayList<>();
+            KafkaProducer producer = createOrGetProducer();
+            int keyVal = (kafkaMsg.getKey().hashCode() & 0x7fffffff) % ATLAS_HOOK_EXTRA_PRODUCR_TOPICS.length;
+            String topicName = ATLAS_HOOK_EXTRA_PRODUCR_TOPICS[keyVal];
+            ProducerRecord record = new ProducerRecord(topicName, kafkaMsg.getKey(), kafkaMsg.getActaulEvent());
+            producer.send(record);
+
+            List<String> failedMessages       = new ArrayList<>();
+            Exception    lastFailureException = null;
+
+            for (MessageContext context : messageContexts) {
+                try {
+                    RecordMetadata response = context.getFuture().get();
+
+                    if (LOG.isDebugEnabled()) {
+                        LOG.debug("Sent message for topic - {}, partition - {}, offset - {}", response.topic(), response.partition(), response.offset());
+                    }
+                } catch (Exception e) {
+                    lastFailureException = e;
+
+                    failedMessages.add(context.getMessage());
+                }
+            }
+        }
         @VisibleForTesting
         void handleMessage(AtlasKafkaMessage<HookNotification> kafkaMsg) throws AtlasServiceException, AtlasException {
             AtlasPerfTracer  perf           = null;

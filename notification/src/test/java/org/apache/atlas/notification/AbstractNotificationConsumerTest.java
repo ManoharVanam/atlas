@@ -229,6 +229,11 @@ public class AbstractNotificationConsumerTest {
         public List<AtlasKafkaMessage<TestMessage>> receiveWithCheckedCommit(Map<TopicPartition, Long> lastCommittedPartitionOffset) {
             return receive();
         }
+
+        @Override
+        public boolean isExtraConsumer() {
+            return false;
+        }
     }
 
     public static class TestMessageDeserializer extends AbstractMessageDeserializer<TestMessage> {
